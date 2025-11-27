@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sonar Blind - Stealth Update</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.4.0/p5.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.4.0/addons/p5.sound.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/matter-js/0.18.0/matter.min.js"></script>
+    <style>
+        body { margin: 0; padding: 0; overflow: hidden; background-color: #000; }
+        canvas { display: block; }
+        #ui {
+            position: absolute; top: 20px; left: 20px; 
+            color: #0f0; font-family: 'Courier New', monospace;
+            font-size: 16px; pointer-events: none;
+            text-shadow: 0 0 5px #0f0;
+            background: rgba(0,0,0,0.5); padding: 10px;
+        }
+    </style>
+</head>
+<body>
+    <div id="ui">
+        <span id="levelText">LEVEL: 1</span><br>
+        <span id="decoysText">DECOYS: 5/5</span><br>
+        OBJECTIVE: LOCATE BLUE EXIT<br>
+        -----------------------------<br>
+        [WASD] Move <br>
+        [SPACE] Self Ping (Attracts Enemy)<br>
+        [MOUSE CLICK] Throw Decoy (Distracts Enemy)
+    </div>
+
+<script>
+// --- MODULE ALIASES ---
+const Engine = Matter.Engine, World = Matter.World, Bodies = Matter.Bodies, 
+      Body = Matter.Body, Events = Matter.Events, Composite = Matter.Composite,
+      Vector = Matter.Vector;
+
+// --- GAME VARIABLES ---
+let engine;
+let player, goal, enemy;
+let walls = [];
+let pulses = [];
+let particles = []; 
+let decoys = []; // Array for active decoys with timers
+const MAX_DECOYS = 5; // Maximum number of decoys allowed
+
+// Helper function to update decoy counter UI
+function updateDecoyCounter() {
+    const remainingDecoys = Math.max(0, MAX_DECOYS - decoys.length);
+    document.getElementById('decoysText').innerText = `DECOYS: ${remainingDecoys}/${MAX_DECOYS}`;
+    return remainingDecoys > 0;
+}
+let gameState = "START"; 
+let level = 1;
+let audioStarted = false;
+
+// --- AI VARIABLES ---
+let enemyState = "PATROL"; 
+let lastKnownPos = { x: 0, y: 0 }; 
+let enemyPatrolDir = { x: 0, y: 0 };
+
+// --- AUDIO & CONFIG ---
+let pingOsc, humOsc, alertOsc, thudOsc;
+const FADE_SPEED = 2.5; 
+const PULSE_SPEED = 9; 
+const MAX_PULSE_SIZE = 900;
+let enemyBaseSpeed = 1.0; 
+
+function setup() {
+    createCanvas(windowWidth, windowHeight);
+    rectMode(CENTER); textAlign(CENTER, CENTER); noStroke();
+
+    setupAudio();
+    
+    engine = Engine.create();
+    engine.world.gravity.y = 0; // Top down, no gravity
+    
+    Events.on(engine, 'collisionStart', handleCollisions);
+}
+
+function startFirstLevel() {
+    gameState = "PLAYING";
+    level = 1;
+    enemyBaseSpeed = 1.0;
+    resetLevel();
+}
+
+// --- CORE GAME LOOP ---
+function draw() {
+    background(0, 40); 
+
+    if (gameState === "START") { drawStartScreen(); return; }
+    if (gameState === "LOSE") { drawLoseScreen(); return; }
+    
+    Engine.update(engine);
+
+    handleInput();
+    updateAI(); 
+    updatePulses();
+    updateParticles();
+    
+    // Decoys need to be removed if they fly off screen
+    updateDecoys();
+    
+    drawWalls();
+    drawGoal();
+    drawEnemy();
+    drawPlayer();
+    drawDecoys(); // Draw the flying rocks
+    drawParticles();
+    
+    // UI: Draw Enemy State
+    if(enemyState === "HUNT") {
+        fill(255, 0, 0); textSize(12);
+        text("!!! HUNTING !!!", enemy.position.x, enemy.position.y - 30);
+    }
+}
+
+// --- 1. AI LOGIC (HEARING SYSTEM) ---
+function updateAI() {
+    let currentSpeed = enemyBaseSpeed;
+
+    if (enemyState === "HUNT") {
+        // Move towards the last sound (Player OR Decoy)
+        let dir = Vector.sub(lastKnownPos, enemy.position);
+        let dist = Vector.magnitude(dir);
+
+        if (dist > 30) {
+             let normalized = Vector.normalise(dir);
+             Body.setVelocity(enemy, { x: normalized.x * currentSpeed * 1.6, y: normalized.y * currentSpeed * 1.6 });
+        } else {
+            // Reached source of sound, nothing there? Go back to patrol
+            enemyState = "PATROL";
+        }
+        
+        // Louder hum when hunting
+        let playerDist = Vector.magnitude(Vector.sub(player.position, enemy.position));
+        humOsc.amp(map(playerDist, 0, 600, 0.4, 0, true), 0.1);
+
+    } else {
+        // PATROL: Random movement
+        if (frameCount % 120 === 0) {
+             enemyPatrolDir = Vector.create(random(-1, 1), random(-1, 1));
+             Vector.normalise(enemyPatrolDir);
+        }
+        Body.setVelocity(enemy, { x: enemyPatrolDir.x * currentSpeed * 0.5, y: enemyPatrolDir.y * currentSpeed * 0.5 });
+        humOsc.amp(0.05, 0.5); 
+    }
+}
+
+// --- 2. DECOY LOGIC (THROWING) ---
+function fireDecoy() {
+    // Check if we have any decoys left to use
+    if (decoys.length >= MAX_DECOYS) {
+        return; // No more decoys can be used this level
+    }
+    
+    // Calculate direction from player to mouse
+    let mouseVec = { x: mouseX, y: mouseY };
+    let dir = Vector.sub(mouseVec, player.position);
+    let normalized = Vector.normalise(dir);
+    
+    // Spawn rock slightly in front of player so it doesn't hit player
+    let spawnPos = Vector.add(player.position, Vector.mult(normalized, 25));
+    
+    let rock = Bodies.circle(spawnPos.x, spawnPos.y, 5, {
+        label: 'decoy',
+        frictionAir: 0,
+        restitution: 0.8
+    });
+    
+    // Shoot it
+    Body.setVelocity(rock, { x: normalized.x * 12, y: normalized.y * 12 });
+    
+    World.add(engine.world, rock);
+    
+    // Add decoy with expiration time (3 seconds from now)
+    decoys.push({
+        body: rock,
+        createdAt: Date.now(),
+        lifetime: 3000 // 3 seconds in milliseconds
+    });
+    
+    // Update decoy counter in UI
+    updateDecoyCounter();
+}
+
+function updateDecoys() {
+    const now = Date.now();
+    let decoysRemoved = false;
+    
+    for(let i=decoys.length-1; i>=0; i--) {
+        const decoy = decoys[i];
+        const decoyBody = decoy.body;
+        
+        // Remove if expired or off screen
+        const isExpired = (now - decoy.createdAt) > decoy.lifetime;
+        const isOffScreen = decoyBody.position.x < 0 || decoyBody.position.x > width || 
+                          decoyBody.position.y < 0 || decoyBody.position.y > height;
+        
+        if (isExpired || isOffScreen) {
+            World.remove(engine.world, decoyBody);
+            decoys.splice(i, 1);
+            decoysRemoved = true;
+        }
+    }
+    
+    // Only update UI if decoys were removed
+    if (decoysRemoved) {
+        updateDecoyCounter();
+    }
+    
+    // Update decoy opacity based on remaining lifetime
+    decoys.forEach(decoy => {
+        const timeLeft = decoy.lifetime - (now - decoy.createdAt);
+        const fadeStart = 1000; // Start fading 1 second before expiration
+        if (timeLeft < fadeStart) {
+            decoy.body.render.opacity = map(timeLeft, 0, fadeStart, 0.3, 1);
+        }
+    });
+}
+
+function drawDecoys() {
+    decoys.forEach(decoy => {
+        const opacity = decoy.body.render.opacity !== undefined ? 
+                       255 * decoy.body.render.opacity : 255;
+        fill(255, 255, 0, opacity);
+        ellipse(decoy.body.position.x, decoy.body.position.y, 10);
+    });
+}
+
+
+// --- 3. WAVE GENERATION ---
+function createWave(x, y, isQuiet) {
+    let pulse = Bodies.circle(x, y, 10, { isSensor: true, label: 'wave', isStatic: true });
+    World.add(engine.world, pulse);
+    pulses.push(pulse);
+
+    // AI hears this location
+    lastKnownPos = { x: x, y: y };
+    enemyState = "HUNT";
+
+    // Play Sound
+    if(isQuiet) {
+        // Thud sound for rock hitting wall
+        thudOsc.freq(100); thudOsc.amp(0.5, 0.01); setTimeout(() => thudOsc.amp(0, 0.1), 100);
+    } else {
+        // Ping sound for sonar
+        pingOsc.freq(800); pingOsc.amp(0.5, 0.01); setTimeout(() => pingOsc.amp(0, 0.5), 100);
+        // Alert sound
+        alertOsc.freq(400); alertOsc.amp(0.2, 0.05); setTimeout(() => alertOsc.amp(0, 0.2), 200);
+    }
+}
+
+
+// --- COLLISION EVENTS ---
+function handleCollisions(event) {
+    event.pairs.forEach(pair => {
+        let a = pair.bodyA, b = pair.bodyB;
+
+        // --- PLAYER VS WALL (Bumping into things) ---
+        if ((a.label === 'player' && b.label === 'wall') || (b.label === 'player' && a.label === 'wall')) {
+            let wall = a.label === 'wall' ? a : b;
+            wall.visibility = 100; 
+        }
+
+        // --- WAVE VS OBJECTS ---
+        if (a.label === 'wave' || b.label === 'wave') {
+            let target = a.label === 'wave' ? b : a;
+            if (target.label === 'wall' || target.label === 'enemy') {
+                target.visibility = 255;
+            }
+        }
+
+        // --- WIN / LOSE ---
+        if ((a.label === 'player' && b.label === 'goal') || (b.label === 'player' && a.label === 'goal')) {
+            level++; enemyBaseSpeed += 0.2; resetLevel();
+        }
+        if ((a.label === 'player' && b.label === 'enemy') || (b.label === 'player' && a.label === 'enemy')) {
+            gameState = "LOSE"; stopAudio();
+            alertOsc.freq(150); alertOsc.amp(0.8); setTimeout(()=>alertOsc.amp(0, 1.0), 600);
+        }
+    });
+}
+
+// --- STANDARD FUNCTIONS ---
+function resetLevel() {
+    Composite.clear(engine.world, false, true); 
+    walls = []; pulses = []; particles = []; decoys = []; stopAudio();
+    document.getElementById('levelText').innerText = "LEVEL: " + level;
+    updateDecoyCounter(); // Reset the decoy counter UI
+
+    player = Bodies.circle(100, 100, 15, { frictionAir: 0.1, label: 'player' });
+    goal = Bodies.rectangle(width - 100, height - 100, 60, 60, { isSensor: true, isStatic: true, label: 'goal' });
+    enemy = Bodies.circle(width/2 + random(-100,100), height/2 + random(-100,100), 20, { frictionAir: 0.1, label: 'enemy' });
+    enemy.visibility = 0;
+
+    World.add(engine.world, [player, goal, enemy]);
+    createWalls(10 + (level * 2));
+    enemyState = "PATROL"; humOsc.start();
+}
+
+class Particle {
+    constructor(x, y) {
+        this.pos = createVector(x, y);
+        this.vel = p5.Vector.random2D().mult(random(2, 5));
+        this.life = 255;
+    }
+    update() { this.pos.add(this.vel); this.life -= 15; }
+    draw() { fill(255, 255, 0, this.life); ellipse(this.pos.x, this.pos.y, random(2,5)); }
+}
+function updateParticles() {
+     for (let i = particles.length - 1; i >= 0; i--) {
+         particles[i].update(); if (particles[i].life <= 0) particles.splice(i, 1);
+     }
+}
+function drawParticles() { particles.forEach(p => p.draw()); }
+
+function drawWalls() {
+    walls.forEach(wall => {
+        if (wall.visibility > 0) {
+            wall.visibility -= FADE_SPEED;
+            fill(0, wall.visibility, 0); beginShape();
+            wall.vertices.forEach(v => vertex(v.x, v.y)); endShape(CLOSE);
+        }
+    });
+}
+function drawEnemy() {
+    if (enemy.visibility > 0) {
+        enemy.visibility -= FADE_SPEED * 1.5; 
+        fill(255, 50, 50, enemy.visibility); ellipse(enemy.position.x, enemy.position.y, 40);
+        fill(255); text("!", enemy.position.x, enemy.position.y);
+    }
+}
+function drawGoal() {
+    let alpha = 150 + Math.sin(frameCount * 0.1) * 100;
+    fill(50, 150, 255, alpha); rect(goal.position.x, goal.position.y, 60, 60);
+    fill(255); text("EXIT", goal.position.x, goal.position.y);
+}
+function drawPlayer() { fill(255); ellipse(player.position.x, player.position.y, 30); }
+function updatePulses() {
+    for (let i = pulses.length - 1; i >= 0; i--) {
+        let p = pulses[i];
+        Body.scale(p, (p.circleRadius + PULSE_SPEED) / p.circleRadius, (p.circleRadius + PULSE_SPEED) / p.circleRadius);
+        noFill(); stroke(0, 255, 100, 200 - (p.circleRadius/4)); strokeWeight(2);
+        ellipse(p.position.x, p.position.y, p.circleRadius * 2);
+        if (p.circleRadius * 2 > MAX_PULSE_SIZE) { World.remove(engine.world, p); pulses.splice(i, 1); }
+    }
+}
+function createWalls(num) {
+    let th = 50;
+    // Border Walls
+    walls.push(Bodies.rectangle(width/2, height, width, th, { isStatic: true, label: 'wall' }));
+    walls.push(Bodies.rectangle(width/2, 0, width, th, { isStatic: true, label: 'wall' }));
+    walls.push(Bodies.rectangle(0, height/2, th, height, { isStatic: true, label: 'wall' }));
+    walls.push(Bodies.rectangle(width, height/2, th, height, { isStatic: true, label: 'wall' }));
+
+    // Create a path from player to goal
+    if (level > 1) {
+        // Create a clear path from player to goal
+        let pathWidth = 150; // Width of the clear path
+        let playerPos = {x: 100, y: 100}; // Starting position
+        let goalPos = {x: width - 100, y: height - 100}; // Goal position
+        
+        // Create a clear path by adding safe zones
+        let midX = (playerPos.x + goalPos.x) / 2;
+        let midY = (playerPos.y + goalPos.y) / 2;
+        
+        // Horizontal safe path
+        walls.push(Bodies.rectangle(midX, playerPos.y - pathWidth/2, Math.abs(goalPos.x - playerPos.x) + pathWidth, 2, { 
+            isStatic: true, 
+            isSensor: true, 
+            render: { visible: false },
+            label: 'safe_path'
+        }));
+        
+        // Vertical safe path
+        walls.push(Bodies.rectangle(goalPos.x, midY, 2, Math.abs(goalPos.y - playerPos.y) + pathWidth, { 
+            isStatic: true, 
+            isSensor: true,
+            render: { visible: false },
+            label: 'safe_path'
+        }));
+    }
+
+    // Random Obstacles with SPAWN PROTECTION and path checking
+    let attempts = 0;
+    const MAX_ATTEMPTS = num * 3; // Limit attempts to prevent infinite loops
+    
+    for(let i=0; i<num && attempts < MAX_ATTEMPTS; i++) {
+        let x = random(100, width-100);
+        let y = random(100, height-100);
+        
+        // Check if position is too close to player, goal, or safe path
+        let tooCloseToPlayer = dist(x, y, 100, 100) < 150;
+        let tooCloseToGoal = dist(x, y, width-100, height-100) < 150;
+        let inSafePathX = abs(x - (width-100)) < 100 && y > 100 && y < height-100;
+        let inSafePathY = abs(y - (height-100)) < 100 && x > 100 && x < width-100;
+        
+        if (tooCloseToPlayer || tooCloseToGoal || inSafePathX || inSafePathY) {
+            i--; // Try again
+            attempts++;
+            continue;
+        }
+
+        // CHECK: Is this too close to the player spawn (100, 100)?
+        // If dist is less than 200px, skip this wall or move it
+        let distToPlayer = dist(x, y, 100, 100);
+        
+        if (distToPlayer > 200) {
+            let obstacle = Bodies.rectangle(x, y, random(50, 250), random(50, 250), { 
+                isStatic: true, 
+                label: 'wall', 
+                angle: random(PI) 
+            });
+            obstacle.visibility = 0; 
+            walls.push(obstacle);
+        } else {
+            // It tried to spawn on player, so we skip this iteration to keep start area clear
+            i--; 
+        }
+    }
+    World.add(engine.world, walls);
+}
+function setupAudio() {
+    pingOsc = new p5.Oscillator('sine'); pingOsc.amp(0); pingOsc.start();
+    humOsc = new p5.Oscillator('sawtooth'); humOsc.freq(60); humOsc.amp(0);
+    alertOsc = new p5.Oscillator('triangle'); alertOsc.amp(0); alertOsc.start();
+    thudOsc = new p5.Oscillator('square'); thudOsc.amp(0); thudOsc.start();
+}
+function stopAudio() { pingOsc.amp(0); humOsc.amp(0); alertOsc.amp(0); thudOsc.amp(0); }
+function drawStartScreen() { fill(255); textSize(30); text("SONAR BLIND", width/2, height/2-40); textSize(16); text("CLICK TO START", width/2, height/2+20); }
+function drawLoseScreen() { fill(255, 50, 50); textSize(40); text("TERMINATED", width/2, height/2); textSize(20); fill(200); text("Level: " + level, width/2, height/2 + 50); text("Click to Restart", width/2, height/2 + 90); }
+
+function handleInput() {
+    let force = 0.005;
+    if (keyIsDown(65)) Body.applyForce(player, player.position, {x: -force, y: 0});
+    if (keyIsDown(68)) Body.applyForce(player, player.position, {x: force, y: 0});
+    if (keyIsDown(87)) Body.applyForce(player, player.position, {x: 0, y: -force});
+    if (keyIsDown(83)) Body.applyForce(player, player.position, {x: 0, y: 0.005});
+}
+function mousePressed() {
+    if (!audioStarted) { userStartAudio(); audioStarted = true; }
+    if (gameState === "START" || gameState === "LOSE") startFirstLevel(); 
+    else fireDecoy(); // CLICK NOW FIRES DECOY
+}
+function keyPressed() { if (key === ' ' && gameState === "PLAYING") createWave(player.position.x, player.position.y, false); } // SPACE FIRES PING
+function windowResized() { resizeCanvas(windowWidth, windowHeight); }
+</script>
+</body>
+</html>
